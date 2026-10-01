@@ -11,6 +11,7 @@ import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
+import android.view.WindowInsets
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.TextView
@@ -87,6 +88,7 @@ class MainActivity : Activity() {
 
         touchCapture = TouchInputCapture(
             activeRect = { activeRect },
+            topGestureZonePx = { topGestureZonePx() },
             onSnapshot = { snap ->
                 client.sendTouchSnapshot(snap)
             }
@@ -221,6 +223,24 @@ class MainActivity : Activity() {
             window.attributes = lp
             Log.i(TAG, "screen_off=$dim — brightness override = $target")
         }
+    }
+
+    /**
+     * Height of the top edge band the system reserves for its status-bar
+     * swipe, in window pixels. Measured "ignoring visibility" because the
+     * bars are hidden in this immersive activity, yet the swipe still works
+     * from that band. The mandatory-system-gesture inset covers gesture-nav
+     * devices where that band is taller than the status bar itself.
+     */
+    private fun topGestureZonePx(): Int {
+        val insets = window.decorView.rootWindowInsets
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && insets != null) {
+            val statusBar = insets.getInsetsIgnoringVisibility(WindowInsets.Type.statusBars()).top
+            val gestures = insets.getInsets(WindowInsets.Type.mandatorySystemGestures()).top
+            return maxOf(statusBar, gestures)
+        }
+        val id = resources.getIdentifier("status_bar_height", "dimen", "android")
+        return if (id != 0) resources.getDimensionPixelSize(id) else 0
     }
 
     /** Hold the display on while connected, if the PC asked for it. A

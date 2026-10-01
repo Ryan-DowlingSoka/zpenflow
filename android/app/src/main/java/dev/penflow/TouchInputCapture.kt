@@ -19,6 +19,14 @@ import android.view.MotionEvent
  * event for the action-index lookup). On `ACTION_CANCEL` we emit an empty
  * snapshot so the server lifts everything.
  *
+ * **Gesture ownership is decided at touch-down.** A finger that lands
+ * outside [activeRect] or inside the top system-gesture zone (where a
+ * swipe pulls down the status bar / notification shade) is excluded for
+ * its whole lifetime, even after it slides into the picture. Without this
+ * the shade swipe reached the PC as a touch drag once the finger crossed
+ * the zone. A per-event position check alone can't express that, and on
+ * a panel the stream fills edge-to-edge there's no letterbox to catch it.
+ *
  * Stylus / pen events are handled exclusively by [PenInputCapture] — the
  * activity dispatches to it first, so by the time we run the event has no
  * stylus pointers in it. As cheap defence-in-depth we still filter the
@@ -31,8 +39,15 @@ class TouchInputCapture(
     /** Same semantics as [PenInputCapture.activeRect] — fingers landing in
      *  the letterbox bars are excluded from snapshots. */
     private val activeRect: () -> Rect,
+    /** Height in window pixels of the top edge zone the system claims for
+     *  its status-bar swipe. Fingers landing inside it are ignored. */
+    private val topGestureZonePx: () -> Int,
     private val onSnapshot: (TouchSnapshot) -> Unit,
 ) {
+    /** Pointer ids whose touch-down landed outside the forwardable area.
+     *  Cleared per gesture on ACTION_DOWN / ACTION_CANCEL. */
+    private val excludedIds = HashSet<Int>()
+
     data class TouchSnapshot(
         val tsNs: Long,
         val contacts: List<Protocol.TouchContact>,
@@ -53,8 +68,26 @@ class TouchInputCapture(
         val rectT = rect.top.toFloat()
         val haveRect = rect.width() > 0 && rect.height() > 0
 
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                if (ev.actionMasked == MotionEvent.ACTION_DOWN) excludedIds.clear()
+                val i = ev.actionIndex
+                if (startsOutsideForwardableArea(
+                        ev.getX(i), ev.getY(i),
+                        rect.left, rect.top, rect.right, rect.bottom,
+                        topGestureZonePx(),
+                    )
+                ) {
+                    excludedIds.add(ev.getPointerId(i))
+                }
+            }
+        }
+
         val contacts: List<Protocol.TouchContact> = when (ev.actionMasked) {
-            MotionEvent.ACTION_CANCEL -> emptyList()
+            MotionEvent.ACTION_CANCEL -> {
+                excludedIds.clear()
+                emptyList()
+            }
             else -> {
                 // The pointer at actionIndex is lifted on POINTER_UP / UP and
                 // must not appear in the next "currently active" snapshot.
@@ -71,6 +104,7 @@ class TouchInputCapture(
                     // with fingers in this event so we never inject a
                     // non-finger position as a touch on the PC side.
                     if (ev.getToolType(i) != MotionEvent.TOOL_TYPE_FINGER) continue
+                    if (ev.getPointerId(i) in excludedIds) continue
                     val fx = ev.getX(i)
                     val fy = ev.getY(i)
                     if (haveRect) {
@@ -91,6 +125,13 @@ class TouchInputCapture(
             }
         }
 
+        // The lifted pointer is already absent from this snapshot; forget its
+        // exclusion so a later pointer that reuses the id is judged afresh.
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_UP ->
+                excludedIds.remove(ev.getPointerId(ev.actionIndex))
+        }
+
         Log.d(TAG, "snapshot: ${contacts.size} contacts -> sending")
         onSnapshot(TouchSnapshot(ev.eventTime * 1_000_000L, contacts))
         return true
@@ -98,5 +139,27 @@ class TouchInputCapture(
 
     companion object {
         private const val TAG = "TouchInputCapture"
+
+        /**
+         * Whether a finger landing at `(x, y)` (window pixels) should be
+         * kept off the PC for its whole gesture: inside the top
+         * system-gesture zone, or outside the active rect when one is known
+         * (empty rect = pre-handshake, no letterbox to test against).
+         * Takes the rect's edges rather than a `Rect` so it stays testable
+         * on the plain JVM, where `android.graphics.Rect` is a stub.
+         */
+        fun startsOutsideForwardableArea(
+            x: Float,
+            y: Float,
+            left: Int,
+            top: Int,
+            right: Int,
+            bottom: Int,
+            topZonePx: Int,
+        ): Boolean {
+            if (y < topZonePx) return true
+            if (right <= left || bottom <= top) return false
+            return x < left || x > right || y < top || y > bottom
+        }
     }
 }
