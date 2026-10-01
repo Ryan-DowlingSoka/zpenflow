@@ -2,9 +2,11 @@ package dev.penflow
 
 import android.app.Activity
 import android.graphics.Rect
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.Gravity
+import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -130,6 +132,24 @@ class MainActivity : Activity() {
         client.connect(detectDeviceCaps())
     }
 
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        // By default the view root batches MOVE / HOVER_MOVE samples and
+        // delivers them once per vsync (as MotionEvent history), which holds
+        // every pen sample back by up to a full frame before we can forward
+        // it. Unbuffered dispatch hands each sample over as soon as the
+        // digitizer reports it. The request propagates up the hierarchy as a
+        // pointer-class request, so it applies to the whole window — and to
+        // fingers as well as the pen — even though the activity consumes the
+        // events before any view sees them. Must run once the decor view is
+        // attached, or there is no view root for the request to reach.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            findViewById<View>(android.R.id.content)
+                .requestUnbufferedDispatch(InputDevice.SOURCE_STYLUS)
+            Log.i(TAG, "unbuffered stylus dispatch requested")
+        }
+    }
+
     override fun onStop() {
         client.disconnect()
         super.onStop()
@@ -141,6 +161,14 @@ class MainActivity : Activity() {
     }
 
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        // Pre-Android 11 fallback: the source-wide request above isn't
+        // available, but a per-gesture request on DOWN is (it lapses at UP,
+        // and can't cover hover).
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R &&
+            ev.actionMasked == MotionEvent.ACTION_DOWN
+        ) {
+            findViewById<View>(android.R.id.content).requestUnbufferedDispatch(ev)
+        }
         // Pen events first (they use a different toolType so don't conflict with
         // touch). If the pen capture rejects the event (toolType=FINGER), fall
         // through to touch capture.
