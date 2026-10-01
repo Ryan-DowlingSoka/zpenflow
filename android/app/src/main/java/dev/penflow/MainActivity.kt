@@ -119,6 +119,7 @@ class MainActivity : Activity() {
                         if (cfg.screenOff) android.view.View.GONE
                         else android.view.View.VISIBLE
                     applyScreenBrightness(cfg.screenOff)
+                    applyKeepAwake(cfg.keepAwake)
                 }
             },
         )
@@ -164,6 +165,10 @@ class MainActivity : Activity() {
                 "connected ${st.width}x${st.height}@${st.fps}"
             is PenflowClient.State.Error -> "error: ${st.message}"
         }
+        // Keep-awake is granted per session by CLIENT_CONFIG; drop it the
+        // moment the session ends so an idle, disconnected tablet sleeps
+        // on its normal timeout.
+        if (st !is PenflowClient.State.Connected) applyKeepAwake(false)
         if (st is PenflowClient.State.Connected) {
             // Run the contain layout in both modes so activeRect preserves
             // the target monitor's aspect ratio — otherwise pen strokes
@@ -187,6 +192,17 @@ class MainActivity : Activity() {
             lp.screenBrightness = target
             window.attributes = lp
             Log.i(TAG, "screen_off=$dim — brightness override = $target")
+        }
+    }
+
+    /** Hold the display on while connected, if the PC asked for it. A
+     *  window flag rather than a WakeLock: no permission, and the system
+     *  releases it automatically whenever the activity leaves the screen. */
+    private fun applyKeepAwake(keepAwake: Boolean) {
+        if (keepAwake) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
     }
 

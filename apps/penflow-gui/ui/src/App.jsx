@@ -981,6 +981,15 @@ export default function App() {
                         onChange={(_, d) => setSettings({ ...settings, hud_enabled: d.checked })}
                     />
                 </div>
+                <div className={styles.row}>
+                    <span className={styles.rowLabel} title="Stop the tablet display from sleeping while it's connected to Penflow. Pen hover and PC-side activity don't count as tablet activity, so without this the tablet follows its own screen timeout and the session drops when it sleeps. Takes effect after the next reconnect.">
+                        Keep tablet awake while connected
+                    </span>
+                    <Switch
+                        checked={settings.keep_tablet_awake !== false}
+                        onChange={(_, d) => setSettings({ ...settings, keep_tablet_awake: d.checked })}
+                    />
+                </div>
                 <Caption1 style={{ color: tokens.colorNeutralForeground4 }}>
                     {elevated ? "Currently running as administrator" : "Currently running unelevated"}
                 </Caption1>

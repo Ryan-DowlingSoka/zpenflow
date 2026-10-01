@@ -61,6 +61,11 @@ pub struct Settings {
     /// interpreting fingers as taps. Pen samples are unaffected.
     #[serde(default)]
     pub disable_touch: bool,
+    /// Hold the tablet display awake while a session is connected. Default
+    /// on: pen hover and PC-side activity don't reset Android's sleep
+    /// timeout, and the tablet sleeping ends the session.
+    #[serde(default = "default_keep_tablet_awake")]
+    pub keep_tablet_awake: bool,
     /// Pen-tip parallax offset in target-monitor pixels (+x right, +y
     /// down). Applied live to a running session.
     #[serde(default)]
@@ -70,6 +75,10 @@ pub struct Settings {
 }
 
 fn default_hud_enabled() -> bool {
+    true
+}
+
+fn default_keep_tablet_awake() -> bool {
     true
 }
 
@@ -91,6 +100,7 @@ impl Default for Settings {
             topology: TopologyMode::default(),
             screen_off: false,
             disable_touch: false,
+            keep_tablet_awake: default_keep_tablet_awake(),
             pen_offset_x: 0,
             pen_offset_y: 0,
         }
@@ -441,6 +451,7 @@ mod tests {
     #[test]
     fn settings_from_older_versions_get_new_defaults() {
         let s: Settings = serde_json::from_str("{}").expect("empty settings should parse");
+        assert!(s.keep_tablet_awake);
         assert_eq!((s.pen_offset_x, s.pen_offset_y), (0, 0));
     }
 }

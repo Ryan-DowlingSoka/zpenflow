@@ -487,6 +487,7 @@ fn build_session_config(settings: &SharedSettings, pen_offset: &Arc<PenOffset>) 
         screen_off: s.screen_off && matches!(s.topology, settings::TopologyMode::Duplicate),
         // Disable-touch is exposed only in the Duplicate options card.
         disable_touch: s.disable_touch && matches!(s.topology, settings::TopologyMode::Duplicate),
+        keep_awake: s.keep_tablet_awake,
         pen_offset: Arc::clone(pen_offset),
         pen_profile: build_pen_profile(&s.bindings),
     }

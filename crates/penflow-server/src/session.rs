@@ -37,10 +37,10 @@ use penflow_core::Engine;
 use penflow_protocol::{
     encode_frame, extract_h264_nals, extract_hevc_nals, read_frame, write_frame, ClientConfig,
     HelloAndroid, HelloPc, PenEvent, Telemetry, TimeSyncReq, TimeSyncResp, TouchEvent, VideoFrame,
-    CLIENT_CFG_FLAG_HUD, CLIENT_CFG_FLAG_SCREEN_OFF, CODEC_H264, CODEC_HEVC, FRAME_FLAG_EXTENDED,
-    FRAME_FLAG_KEYFRAME, MSG_ANDROID_GOODBYE, MSG_CLIENT_CONFIG, MSG_HELLO_ANDROID, MSG_HELLO_PC,
-    MSG_PC_GOODBYE, MSG_PEN_EVENT, MSG_REQUEST_IDR, MSG_TELEMETRY, MSG_TIME_SYNC_REQ,
-    MSG_TIME_SYNC_RESP, MSG_TOUCH_EVENT, MSG_VIDEO_CONFIG, MSG_VIDEO_FRAME,
+    CLIENT_CFG_FLAG_HUD, CLIENT_CFG_FLAG_KEEP_AWAKE, CLIENT_CFG_FLAG_SCREEN_OFF, CODEC_H264,
+    CODEC_HEVC, FRAME_FLAG_EXTENDED, FRAME_FLAG_KEYFRAME, MSG_ANDROID_GOODBYE, MSG_CLIENT_CONFIG,
+    MSG_HELLO_ANDROID, MSG_HELLO_PC, MSG_PC_GOODBYE, MSG_PEN_EVENT, MSG_REQUEST_IDR, MSG_TELEMETRY,
+    MSG_TIME_SYNC_REQ, MSG_TIME_SYNC_RESP, MSG_TOUCH_EVENT, MSG_VIDEO_CONFIG, MSG_VIDEO_FRAME,
 };
 use penflow_transport::{Transport, TransportStream};
 
@@ -197,6 +197,9 @@ pub struct SessionConfig {
     /// Drop inbound `MSG_TOUCH_EVENT` frames before they reach the
     /// injector. Pen samples are unaffected.
     pub disable_touch: bool,
+    /// Ask the client to hold its display awake for the session
+    /// (`CLIENT_CFG_FLAG_KEEP_AWAKE`).
+    pub keep_awake: bool,
     /// Live pen-tip offset; see [`PenOffset`].
     pub pen_offset: Arc<PenOffset>,
     /// Pen-button bindings to apply on the per-session injector. Default
@@ -258,6 +261,7 @@ impl Default for SessionConfig {
             hud_enabled: true,
             screen_off: false,
             disable_touch: false,
+            keep_awake: false,
             pen_offset: Arc::new(PenOffset::default()),
             pen_profile: penflow_core::inject::binding::PenButtonProfile::default(),
         }
@@ -593,13 +597,14 @@ impl Session {
         // unused in v0 clients, so any older client gracefully skips it
         // (read_frame returns Ok and the dispatch loop's `_` arm drops
         // unknown ids). New clients toggle the HUD based on bit 0.
-        let client_cfg = ClientConfig {
-            flags: if self.cfg.hud_enabled {
-                CLIENT_CFG_FLAG_HUD
-            } else {
-                0
-            },
-        };
+        let mut cfg_flags = 0;
+        if self.cfg.hud_enabled {
+            cfg_flags |= CLIENT_CFG_FLAG_HUD;
+        }
+        if self.cfg.keep_awake {
+            cfg_flags |= CLIENT_CFG_FLAG_KEEP_AWAKE;
+        }
+        let client_cfg = ClientConfig { flags: cfg_flags };
         write_frame(&mut writer, MSG_CLIENT_CONFIG, &client_cfg.encode()).await?;
 
         write_frame(&mut writer, MSG_VIDEO_CONFIG, &csd0).await?;
@@ -849,6 +854,9 @@ impl Session {
         let mut cfg_flags = CLIENT_CFG_FLAG_SCREEN_OFF;
         if self.cfg.hud_enabled {
             cfg_flags |= CLIENT_CFG_FLAG_HUD;
+        }
+        if self.cfg.keep_awake {
+            cfg_flags |= CLIENT_CFG_FLAG_KEEP_AWAKE;
         }
         let client_cfg = ClientConfig { flags: cfg_flags };
         write_frame(&mut writer, MSG_CLIENT_CONFIG, &client_cfg.encode()).await?;
