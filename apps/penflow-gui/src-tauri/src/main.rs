@@ -304,6 +304,15 @@ fn main() -> std::process::ExitCode {
         }
     }
 
+    // Register the virtual touchscreen now, and keep it for as long as the
+    // GUI runs, rather than only while a tablet session is up. Apps check
+    // for touch hardware when they launch, so one started while no tablet
+    // was connected would otherwise never enable touch input.
+    #[cfg(windows)]
+    if let Err(e) = penflow_core::inject::win_ink::shared_touch_device() {
+        eprintln!("[gui] registering virtual touchscreen failed: {e:?}");
+    }
+
     // Crash-recovery: if a previous Penflow instance died abnormally
     // (Task Manager kill, BSOD, panic before Drop ran) or the MSI
     // installer left VDD in its install-time enabled state, the device

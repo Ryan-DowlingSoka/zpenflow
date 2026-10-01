@@ -31,6 +31,7 @@
 //! session's input subsystem.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 use windows::Win32::Foundation::POINT;
 use windows::Win32::UI::Controls::{
@@ -68,12 +69,45 @@ use super::{PenSample, TouchPoint};
 /// (HANDOFF §1.5) and is plenty for the MovinkPad's 10-finger panel.
 const MAX_TOUCH_CONTACTS: u32 = 10;
 
+/// The process-wide synthetic touchscreen. See [`shared_touch_device`].
+struct SharedTouchDevice(HSYNTHETICPOINTERDEVICE);
+
+// SAFETY: synthetic pointer device handles are usable from any thread once
+// created (see the `Send` note on `InputInjector`). The handle is only ever
+// read after creation, and creation is serialised by `TOUCH_DEVICE`'s lock.
+unsafe impl Send for SharedTouchDevice {}
+
+static TOUCH_DEVICE: Mutex<Option<SharedTouchDevice>> = Mutex::new(None);
+
+/// The synthetic touchscreen shared by every session, created on first use
+/// and never destroyed. Windows removes it when the process exits.
+///
+/// Kept for the life of the process rather than per session because apps
+/// probe for touch hardware at launch: Chromium/Electron apps (VS Code,
+/// for one) only enable touch events if a touchscreen existed when they
+/// started, so a device that vanishes between sessions leaves apps opened
+/// in that gap treating every finger as a mouse. Hosts that want the device
+/// visible before any tablet connects call this at startup.
+pub fn shared_touch_device() -> EngineResult<HSYNTHETICPOINTERDEVICE> {
+    let mut guard = TOUCH_DEVICE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(device) = guard.as_ref() {
+        return Ok(device.0);
+    }
+    let handle = unsafe {
+        CreateSyntheticPointerDevice(PT_TOUCH, MAX_TOUCH_CONTACTS, POINTER_FEEDBACK_DEFAULT)
+            .map_err(EngineError::from)?
+    };
+    *guard = Some(SharedTouchDevice(handle));
+    Ok(handle)
+}
+
 /// Unified pen + touch injector backed by Win32 synthetic pointer devices.
 pub struct InputInjector {
     /// `CreateSyntheticPointerDevice(PT_PEN, 1, …)` handle. Must outlive
     /// every `InjectSyntheticPointerInput` we issue.
     pen_device: HSYNTHETICPOINTERDEVICE,
-    /// `CreateSyntheticPointerDevice(PT_TOUCH, MAX_TOUCH_CONTACTS, …)`.
+    /// The process-wide touchscreen from [`shared_touch_device`]. Borrowed,
+    /// not owned: never destroyed by the injector.
     touch_device: HSYNTHETICPOINTERDEVICE,
 
     // --- pen flip-then-flush state (HANDOFF §1.5) ---
@@ -112,8 +146,9 @@ pub struct InputInjector {
 unsafe impl Send for InputInjector {}
 
 impl InputInjector {
-    /// Build the injector and register synthetic pointer devices for both
-    /// pen (max 1 simultaneous) and touch (max 10). Sets
+    /// Build the injector: registers a synthetic pen device (max 1
+    /// simultaneous) for this session and attaches to the shared touch
+    /// device (max 10, see [`shared_touch_device`]). Sets
     /// `PER_MONITOR_AWARE_V2` process-wide so injected pixel coordinates are
     /// physical pixels, not DIPs.
     pub fn new() -> EngineResult<Self> {
@@ -131,14 +166,12 @@ impl InputInjector {
             CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT)
                 .map_err(EngineError::from)?
         };
-        let touch_device = match unsafe {
-            CreateSyntheticPointerDevice(PT_TOUCH, MAX_TOUCH_CONTACTS, POINTER_FEEDBACK_DEFAULT)
-        } {
+        let touch_device = match shared_touch_device() {
             Ok(h) => h,
             Err(e) => {
                 // Tear down the pen device before bailing — we own it now.
                 unsafe { DestroySyntheticPointerDevice(pen_device) };
-                return Err(EngineError::from(e));
+                return Err(e);
             }
         };
 
@@ -495,8 +528,15 @@ impl InputInjector {
 
 impl Drop for InputInjector {
     fn drop(&mut self) {
+        // The touch device outlives this session, so destroying it can no
+        // longer lift contacts implicitly. Release any fingers still down,
+        // or the OS would see them stuck until the next session touches.
+        if !self.last_touch_pos.is_empty() {
+            if let Err(e) = self.inject_touch(&[]) {
+                eprintln!("[inject] lifting touches on drop failed: {e:?}");
+            }
+        }
         unsafe {
-            DestroySyntheticPointerDevice(self.touch_device);
             DestroySyntheticPointerDevice(self.pen_device);
         }
     }
@@ -743,6 +783,20 @@ fn normalize_absolute_mouse_coord(pos: i32, origin: i32, span: i32) -> i32 {
 mod tests {
     use super::super::TouchState;
     use super::*;
+
+    #[test]
+    #[ignore = "creates a real synthetic pointer device; needs an interactive desktop session"]
+    fn shared_touch_device_is_created_once_and_outlives_injectors() {
+        let first = shared_touch_device().expect("create shared touch device");
+        let second = shared_touch_device().expect("reuse shared touch device");
+        assert_eq!(first, second);
+
+        // An injector borrows the device and must not destroy it on drop.
+        let injector = InputInjector::new().expect("build injector");
+        assert_eq!(injector.touch_device, first);
+        drop(injector);
+        assert_eq!(shared_touch_device().expect("device survives"), first);
+    }
 
     #[test]
     fn pen_flags_hover_arrival() {
