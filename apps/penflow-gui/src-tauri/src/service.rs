@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 
 use penflow_core::inject::binding::{Binding as CoreBinding, MouseButtonKind, PenButtonProfile};
 use penflow_core::Engine;
-use penflow_server::{Session, SessionConfig, SessionEvent, VddController};
+use penflow_server::{PenOffset, Session, SessionConfig, SessionEvent, VddController};
 use penflow_transport::adb::AdbLocalAbstractTransport;
 use penflow_transport::Transport;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -72,6 +72,9 @@ pub struct Service {
     /// call `current()` for the latest snapshot.
     events: broadcast::Sender<ServiceState>,
     settings: SharedSettings,
+    /// Shared with every session's read loop so offset edits apply to a
+    /// connected tablet without a reconnect.
+    pen_offset: Arc<PenOffset>,
 }
 
 struct Inner {
@@ -87,6 +90,10 @@ struct Inner {
 impl Service {
     pub fn new(settings: SharedSettings) -> Self {
         let (tx, _) = broadcast::channel(16);
+        let pen_offset = {
+            let s = settings.read().expect("settings poisoned");
+            Arc::new(PenOffset::new(s.pen_offset_x, s.pen_offset_y))
+        };
         Self {
             inner: Mutex::new(Inner {
                 task: None,
@@ -95,7 +102,13 @@ impl Service {
             }),
             events: tx,
             settings,
+            pen_offset,
         }
+    }
+
+    /// Update the pen-tip offset, including for a session in progress.
+    pub fn set_pen_offset(&self, x: i32, y: i32) {
+        self.pen_offset.set(x, y);
     }
 
     /// Subscribe to state-transition events. Each subscriber gets every
@@ -205,7 +218,7 @@ impl Service {
                 };
 
             eprintln!("[service] building session config (VDD detect…)");
-            let cfg = build_session_config(&self.settings);
+            let cfg = build_session_config(&self.settings, &self.pen_offset);
             eprintln!(
                 "[service] session config: fallback={}x{}@{} codec={:?} vdd={}",
                 cfg.monitor.width,
@@ -373,7 +386,7 @@ fn log_diagnostic(msg: &str) {
     let _ = writeln!(f, "[{now}] {msg}");
 }
 
-fn build_session_config(settings: &SharedSettings) -> SessionConfig {
+fn build_session_config(settings: &SharedSettings, pen_offset: &Arc<PenOffset>) -> SessionConfig {
     let s = settings.read().expect("settings poisoned").clone();
 
     // Duplicate captures the user's primary monitor directly, so the
@@ -474,6 +487,7 @@ fn build_session_config(settings: &SharedSettings) -> SessionConfig {
         screen_off: s.screen_off && matches!(s.topology, settings::TopologyMode::Duplicate),
         // Disable-touch is exposed only in the Duplicate options card.
         disable_touch: s.disable_touch && matches!(s.topology, settings::TopologyMode::Duplicate),
+        pen_offset: Arc::clone(pen_offset),
         pen_profile: build_pen_profile(&s.bindings),
     }
 }

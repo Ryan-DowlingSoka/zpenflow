@@ -97,6 +97,18 @@ impl AffineTransform {
         }
     }
 
+    /// Return a copy whose output is shifted by `(dx, dy)` output pixels.
+    /// The shift is applied after rotation, so it moves the result in
+    /// desktop space regardless of tablet orientation — used for the
+    /// pen-tip parallax offset.
+    pub fn translated(&self, dx: f32, dy: f32) -> Self {
+        Self {
+            e: self.e + dx,
+            f: self.f + dy,
+            ..*self
+        }
+    }
+
     /// Apply the transform to a single point.
     pub fn map(&self, x: f32, y: f32) -> (f32, f32) {
         (
@@ -239,6 +251,20 @@ mod tests {
         let (mx, my) = primary.map_to_vmulti(0.0, 0.0, -3840, -1080, 5760, 2160);
         assert!(mx.abs_diff(21845) <= 1, "got {mx}");
         assert!(my.abs_diff(16383) <= 1, "got {my}");
+    }
+
+    #[test]
+    fn translated_shifts_output_in_desktop_space() {
+        let t =
+            AffineTransform::from_normalized_to_rect(100, 200, 1920, 1080, 0).translated(3.0, -4.0);
+        assert_eq!(t.map_to_pixel(0.0, 0.0), (103, 196));
+        assert_eq!(t.map_to_pixel(1.0, 1.0), (2023, 1276));
+
+        // Rotated: the shift still lands in desktop x/y, not tablet x/y.
+        let r = AffineTransform::from_normalized_to_rect(0, 0, 100, 200, 90);
+        let rt = r.translated(5.0, 7.0);
+        let (bx, by) = r.map_to_pixel(0.3, 0.6);
+        assert_eq!(rt.map_to_pixel(0.3, 0.6), (bx + 5, by + 7));
     }
 
     #[test]

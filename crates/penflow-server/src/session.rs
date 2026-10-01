@@ -20,7 +20,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -108,6 +108,45 @@ pub enum SessionEvent {
     Errored(String),
 }
 
+/// Pen-tip offset in target-monitor pixels, added after the tablet →
+/// desktop mapping to compensate for the gap between the pen nib and the
+/// image on the panel (display parallax). Pen samples only; touch is
+/// unaffected.
+///
+/// Shared via `Arc` and read per pen sample, so the GUI can retune it
+/// while a session is running instead of waiting for a reconnect.
+#[derive(Debug, Default)]
+pub struct PenOffset {
+    x: AtomicI32,
+    y: AtomicI32,
+}
+
+impl PenOffset {
+    /// Offset of `(x, y)` target-monitor pixels.
+    pub fn new(x: i32, y: i32) -> Self {
+        Self {
+            x: AtomicI32::new(x),
+            y: AtomicI32::new(y),
+        }
+    }
+
+    /// Replace the offset. Each axis is stored independently, so a reader
+    /// racing a write may briefly see the new x with the old y — harmless
+    /// for a few pixels of pen nudge.
+    pub fn set(&self, x: i32, y: i32) {
+        self.x.store(x, Ordering::Relaxed);
+        self.y.store(y, Ordering::Relaxed);
+    }
+
+    /// Current `(x, y)` offset in pixels.
+    pub fn get(&self) -> (i32, i32) {
+        (
+            self.x.load(Ordering::Relaxed),
+            self.y.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// Configuration for one session.
 #[derive(Debug)]
 pub struct SessionConfig {
@@ -158,6 +197,8 @@ pub struct SessionConfig {
     /// Drop inbound `MSG_TOUCH_EVENT` frames before they reach the
     /// injector. Pen samples are unaffected.
     pub disable_touch: bool,
+    /// Live pen-tip offset; see [`PenOffset`].
+    pub pen_offset: Arc<PenOffset>,
     /// Pen-button bindings to apply on the per-session injector. Default
     /// is the engine's `PenButtonProfile::default()` (Ctrl/Shift/E). The
     /// GUI converts user-edited `settings::PenBindings` to this struct
@@ -217,6 +258,7 @@ impl Default for SessionConfig {
             hud_enabled: true,
             screen_off: false,
             disable_touch: false,
+            pen_offset: Arc::new(PenOffset::default()),
             pen_profile: penflow_core::inject::binding::PenButtonProfile::default(),
         }
     }
@@ -635,6 +677,7 @@ impl Session {
             idr_tx,
             session_start,
             self.cfg.disable_touch,
+            self.cfg.pen_offset.clone(),
         ));
 
         // 8. Wait for the read loop to finish, while servicing IDR requests.
@@ -840,6 +883,7 @@ impl Session {
             idr_tx,
             session_start,
             self.cfg.disable_touch,
+            self.cfg.pen_offset.clone(),
         );
         let finish_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match finish {
             Some(rx) => Box::pin(async move {
@@ -1024,6 +1068,7 @@ async fn read_loop<R: AsyncRead + Unpin>(
     idr_tx: tokio::sync::mpsc::UnboundedSender<()>,
     session_start: Instant,
     disable_touch: bool,
+    pen_offset: Arc<PenOffset>,
 ) -> Result<(), SessionError> {
     let _ = (android_w, android_h); // captured for future use
 
@@ -1062,6 +1107,10 @@ async fn read_loop<R: AsyncRead + Unpin>(
         match msg_id {
             MSG_PEN_EVENT => {
                 let pe = PenEvent::decode(&payload)?;
+                // Parallax offset, re-read per sample so GUI edits apply
+                // mid-session. Pen only — touch keeps the raw mapping.
+                let (dx, dy) = pen_offset.get();
+                let coords = coords.translated(dx as f32, dy as f32);
                 let (x, y) = coords.map_to_pixel(pe.x_norm, pe.y_norm);
                 // VMulti logical coords, scaled across the virtual screen.
                 // The Win32 / WinRT fallback path ignores these; the
