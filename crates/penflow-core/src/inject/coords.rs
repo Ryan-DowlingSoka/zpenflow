@@ -97,6 +97,18 @@ impl AffineTransform {
         }
     }
 
+    /// Return a copy whose output is shifted by `(dx, dy)` output pixels.
+    /// The shift is applied after rotation, so it moves the result in
+    /// desktop space regardless of tablet orientation — used for the
+    /// pen-tip parallax offset.
+    pub fn translated(&self, dx: f32, dy: f32) -> Self {
+        Self {
+            e: self.e + dx,
+            f: self.f + dy,
+            ..*self
+        }
+    }
+
     /// Apply the transform to a single point.
     pub fn map(&self, x: f32, y: f32) -> (f32, f32) {
         (
@@ -113,23 +125,42 @@ impl AffineTransform {
     }
 
     /// Map normalized pen coords `[0,1]²` to VMulti's logical units
-    /// `[0, 32767]²`, scaled across `(target_w_px, target_h_px)`.
+    /// `[0, 32767]²`, scaled across the target rectangle
+    /// `(target_left, target_top, target_w_px, target_h_px)`.
     ///
     /// VMulti's HID descriptor declares `logical_min/max = 0..32767` per
     /// axis. The receiver-side mapping from those logical units onto
     /// screen pixels happens inside the Windows kernel, using the
     /// digitizer's physical-axis declaration plus the monitor it's
     /// associated with. For a digitizer that spans the full virtual
-    /// screen, callers pass `vscreen_w / vscreen_h` here. For a
-    /// digitizer that should land only on a specific monitor (e.g. the
-    /// VDD), callers can pass that monitor's pixel size and additionally
-    /// shift the output via the affine's translation.
-    pub fn map_to_vmulti(&self, x: f32, y: f32, target_w_px: u32, target_h_px: u32) -> (u16, u16) {
+    /// screen, callers pass the virtual-screen bounding box
+    /// (`SM_XVIRTUALSCREEN`, `SM_YVIRTUALSCREEN`, `SM_CXVIRTUALSCREEN`,
+    /// `SM_CYVIRTUALSCREEN`) here.
+    ///
+    /// The affine outputs primary-relative desktop pixels, which go
+    /// negative for monitors left of / above the primary. Logical 0 is
+    /// the bounding box's top-left corner, not the primary's, so the
+    /// target origin is subtracted before scaling — the same
+    /// primary-relative → bbox-relative shift `win_ink` applies on the
+    /// `InjectSyntheticPointerInput` path. Without it, a layout with a
+    /// monitor left of the primary lands the pen one monitor-width away
+    /// from the tip.
+    pub fn map_to_vmulti(
+        &self,
+        x: f32,
+        y: f32,
+        target_left: i32,
+        target_top: i32,
+        target_w_px: u32,
+        target_h_px: u32,
+    ) -> (u16, u16) {
         let (fx, fy) = self.map(x, y);
+        let rx = fx - target_left as f32;
+        let ry = fy - target_top as f32;
         let tw = target_w_px.max(1) as f32;
         let th = target_h_px.max(1) as f32;
-        let ux = ((fx / tw) * 32767.0).clamp(0.0, 32767.0).round() as u16;
-        let uy = ((fy / th) * 32767.0).clamp(0.0, 32767.0).round() as u16;
+        let ux = ((rx / tw) * 32767.0).clamp(0.0, 32767.0).round() as u16;
+        let uy = ((ry / th) * 32767.0).clamp(0.0, 32767.0).round() as u16;
         (ux, uy)
     }
 }
@@ -163,9 +194,9 @@ mod tests {
         // VDD at origin, 3840x2160; tablet norm [0,1] → VDD pixel [0..3840, 0..2160]
         // → VMulti logical [0..32767].
         let t = AffineTransform::from_normalized_to_rect(0, 0, 3840, 2160, 0);
-        assert_eq!(t.map_to_vmulti(0.0, 0.0, 3840, 2160), (0, 0));
-        assert_eq!(t.map_to_vmulti(1.0, 1.0, 3840, 2160), (32767, 32767));
-        let (mx, my) = t.map_to_vmulti(0.5, 0.5, 3840, 2160);
+        assert_eq!(t.map_to_vmulti(0.0, 0.0, 0, 0, 3840, 2160), (0, 0));
+        assert_eq!(t.map_to_vmulti(1.0, 1.0, 0, 0, 3840, 2160), (32767, 32767));
+        let (mx, my) = t.map_to_vmulti(0.5, 0.5, 0, 0, 3840, 2160);
         assert!(mx.abs_diff(16383) <= 1 && my.abs_diff(16383) <= 1);
     }
 
@@ -175,14 +206,65 @@ mod tests {
         // covers the right half. Tablet (0,0) → VDD top-left → virtual
         // pixel (1920, 0) → VMulti logical (16383, 0).
         let t = AffineTransform::from_normalized_to_rect(1920, 0, 1920, 1080, 0);
-        let (mx, my) = t.map_to_vmulti(0.0, 0.0, 3840, 1080);
+        let (mx, my) = t.map_to_vmulti(0.0, 0.0, 0, 0, 3840, 1080);
         assert!(mx.abs_diff(16383) <= 1, "got {mx}");
         assert_eq!(my, 0);
         // Tablet (1,1) → VDD bottom-right pixel (3840, 1080) → VMulti
         // logical (32767, 32767).
-        let (mx, my) = t.map_to_vmulti(1.0, 1.0, 3840, 1080);
+        let (mx, my) = t.map_to_vmulti(1.0, 1.0, 0, 0, 3840, 1080);
         assert_eq!(mx, 32767);
         assert_eq!(my, 32767);
+    }
+
+    #[test]
+    fn map_to_vmulti_subtracts_negative_virtual_origin() {
+        // Three 3840x2160 monitors: left at x=-3840, primary at 0, right
+        // at 3840. Virtual screen bbox = (-3840, 0, 11520, 2160).
+        let (vl, vt, vw, vh) = (-3840, 0, 11520, 2160);
+
+        // Capturing the primary: its left edge is one third of the way
+        // across the bbox, its right edge two thirds.
+        let primary = AffineTransform::from_normalized_to_rect(0, 0, 3840, 2160, 0);
+        let (mx, my) = primary.map_to_vmulti(0.0, 0.0, vl, vt, vw, vh);
+        assert!(mx.abs_diff(10922) <= 1, "got {mx}");
+        assert_eq!(my, 0);
+        let (mx, _) = primary.map_to_vmulti(1.0, 1.0, vl, vt, vw, vh);
+        assert!(mx.abs_diff(21845) <= 1, "got {mx}");
+
+        // Capturing the left monitor: spans the first third of the bbox
+        // instead of collapsing onto logical 0.
+        let left = AffineTransform::from_normalized_to_rect(-3840, 0, 3840, 2160, 0);
+        let (mx, _) = left.map_to_vmulti(0.0, 0.5, vl, vt, vw, vh);
+        assert_eq!(mx, 0);
+        let (mx, _) = left.map_to_vmulti(0.5, 0.5, vl, vt, vw, vh);
+        assert!(mx.abs_diff(5461) <= 1, "got {mx}");
+        let (mx, _) = left.map_to_vmulti(1.0, 0.5, vl, vt, vw, vh);
+        assert!(mx.abs_diff(10922) <= 1, "got {mx}");
+    }
+
+    #[test]
+    fn map_to_vmulti_subtracts_negative_vertical_origin() {
+        // 4K monitor taller than a 1080p primary to its left, top at -1080.
+        // Virtual bbox = (-3840, -1080, 5760, 2160). Primary's top edge
+        // sits halfway down the bbox.
+        let primary = AffineTransform::from_normalized_to_rect(0, 0, 1920, 1080, 0);
+        let (mx, my) = primary.map_to_vmulti(0.0, 0.0, -3840, -1080, 5760, 2160);
+        assert!(mx.abs_diff(21845) <= 1, "got {mx}");
+        assert!(my.abs_diff(16383) <= 1, "got {my}");
+    }
+
+    #[test]
+    fn translated_shifts_output_in_desktop_space() {
+        let t =
+            AffineTransform::from_normalized_to_rect(100, 200, 1920, 1080, 0).translated(3.0, -4.0);
+        assert_eq!(t.map_to_pixel(0.0, 0.0), (103, 196));
+        assert_eq!(t.map_to_pixel(1.0, 1.0), (2023, 1276));
+
+        // Rotated: the shift still lands in desktop x/y, not tablet x/y.
+        let r = AffineTransform::from_normalized_to_rect(0, 0, 100, 200, 90);
+        let rt = r.translated(5.0, 7.0);
+        let (bx, by) = r.map_to_pixel(0.3, 0.6);
+        assert_eq!(rt.map_to_pixel(0.3, 0.6), (bx + 5, by + 7));
     }
 
     #[test]

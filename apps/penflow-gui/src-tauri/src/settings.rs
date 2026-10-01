@@ -61,11 +61,30 @@ pub struct Settings {
     /// interpreting fingers as taps. Pen samples are unaffected.
     #[serde(default)]
     pub disable_touch: bool,
+    /// Hold the tablet display awake while a session is connected. Default
+    /// on: pen hover and PC-side activity don't reset Android's sleep
+    /// timeout, and the tablet sleeping ends the session.
+    #[serde(default = "default_keep_tablet_awake")]
+    pub keep_tablet_awake: bool,
+    /// Pen-tip parallax offset in target-monitor pixels (+x right, +y
+    /// down). Applied live to a running session.
+    #[serde(default)]
+    pub pen_offset_x: i32,
+    #[serde(default)]
+    pub pen_offset_y: i32,
 }
 
 fn default_hud_enabled() -> bool {
     true
 }
+
+fn default_keep_tablet_awake() -> bool {
+    true
+}
+
+/// Bound on each pen-offset axis. Parallax is a few pixels; anything
+/// larger is almost certainly a typo.
+pub const MAX_PEN_OFFSET: i32 = 200;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -81,6 +100,9 @@ impl Default for Settings {
             topology: TopologyMode::default(),
             screen_off: false,
             disable_touch: false,
+            keep_tablet_awake: default_keep_tablet_awake(),
+            pen_offset_x: 0,
+            pen_offset_y: 0,
         }
     }
 }
@@ -159,7 +181,14 @@ impl DisplayResolution {
 }
 
 pub fn validate(s: &Settings) -> Result<(), String> {
-    s.vdd_resolution.validate()
+    s.vdd_resolution.validate()?;
+    let range = -MAX_PEN_OFFSET..=MAX_PEN_OFFSET;
+    if !range.contains(&s.pen_offset_x) || !range.contains(&s.pen_offset_y) {
+        return Err(format!(
+            "pen offset must be between -{MAX_PEN_OFFSET} and {MAX_PEN_OFFSET} pixels"
+        ));
+    }
+    Ok(())
 }
 
 /// Local serializable shadow of `penflow_core::encoder::Codec`. Wrapper
@@ -400,5 +429,29 @@ mod tests {
         .validate()
         .expect_err("odd width should be rejected");
         assert!(err.contains("even"));
+    }
+
+    #[test]
+    fn pen_offset_is_bounded() {
+        let ok = Settings {
+            pen_offset_x: -MAX_PEN_OFFSET,
+            pen_offset_y: MAX_PEN_OFFSET,
+            ..Settings::default()
+        };
+        validate(&ok).expect("offset at the bound should be valid");
+
+        let too_far = Settings {
+            pen_offset_x: MAX_PEN_OFFSET + 1,
+            ..Settings::default()
+        };
+        let err = validate(&too_far).expect_err("offset past the bound should be rejected");
+        assert!(err.contains("pen offset"));
+    }
+
+    #[test]
+    fn settings_from_older_versions_get_new_defaults() {
+        let s: Settings = serde_json::from_str("{}").expect("empty settings should parse");
+        assert!(s.keep_tablet_awake);
+        assert_eq!((s.pen_offset_x, s.pen_offset_y), (0, 0));
     }
 }

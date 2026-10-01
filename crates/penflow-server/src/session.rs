@@ -20,7 +20,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -37,16 +37,16 @@ use penflow_core::Engine;
 use penflow_protocol::{
     encode_frame, extract_h264_nals, extract_hevc_nals, read_frame, write_frame, ClientConfig,
     HelloAndroid, HelloPc, PenEvent, Telemetry, TimeSyncReq, TimeSyncResp, TouchEvent, VideoFrame,
-    CLIENT_CFG_FLAG_HUD, CLIENT_CFG_FLAG_SCREEN_OFF, CODEC_H264, CODEC_HEVC, FRAME_FLAG_EXTENDED,
-    FRAME_FLAG_KEYFRAME, MSG_ANDROID_GOODBYE, MSG_CLIENT_CONFIG, MSG_HELLO_ANDROID, MSG_HELLO_PC,
-    MSG_PC_GOODBYE, MSG_PEN_EVENT, MSG_REQUEST_IDR, MSG_TELEMETRY, MSG_TIME_SYNC_REQ,
-    MSG_TIME_SYNC_RESP, MSG_TOUCH_EVENT, MSG_VIDEO_CONFIG, MSG_VIDEO_FRAME,
+    CLIENT_CFG_FLAG_HUD, CLIENT_CFG_FLAG_KEEP_AWAKE, CLIENT_CFG_FLAG_SCREEN_OFF, CODEC_H264,
+    CODEC_HEVC, FRAME_FLAG_EXTENDED, FRAME_FLAG_KEYFRAME, MSG_ANDROID_GOODBYE, MSG_CLIENT_CONFIG,
+    MSG_HELLO_ANDROID, MSG_HELLO_PC, MSG_PC_GOODBYE, MSG_PEN_EVENT, MSG_REQUEST_IDR, MSG_TELEMETRY,
+    MSG_TIME_SYNC_REQ, MSG_TIME_SYNC_RESP, MSG_TOUCH_EVENT, MSG_VIDEO_CONFIG, MSG_VIDEO_FRAME,
 };
 use penflow_transport::{Transport, TransportStream};
 
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
 use crate::vdd::{
@@ -108,6 +108,45 @@ pub enum SessionEvent {
     Errored(String),
 }
 
+/// Pen-tip offset in target-monitor pixels, added after the tablet →
+/// desktop mapping to compensate for the gap between the pen nib and the
+/// image on the panel (display parallax). Pen samples only; touch is
+/// unaffected.
+///
+/// Shared via `Arc` and read per pen sample, so the GUI can retune it
+/// while a session is running instead of waiting for a reconnect.
+#[derive(Debug, Default)]
+pub struct PenOffset {
+    x: AtomicI32,
+    y: AtomicI32,
+}
+
+impl PenOffset {
+    /// Offset of `(x, y)` target-monitor pixels.
+    pub fn new(x: i32, y: i32) -> Self {
+        Self {
+            x: AtomicI32::new(x),
+            y: AtomicI32::new(y),
+        }
+    }
+
+    /// Replace the offset. Each axis is stored independently, so a reader
+    /// racing a write may briefly see the new x with the old y — harmless
+    /// for a few pixels of pen nudge.
+    pub fn set(&self, x: i32, y: i32) {
+        self.x.store(x, Ordering::Relaxed);
+        self.y.store(y, Ordering::Relaxed);
+    }
+
+    /// Current `(x, y)` offset in pixels.
+    pub fn get(&self) -> (i32, i32) {
+        (
+            self.x.load(Ordering::Relaxed),
+            self.y.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// Configuration for one session.
 #[derive(Debug)]
 pub struct SessionConfig {
@@ -158,6 +197,11 @@ pub struct SessionConfig {
     /// Drop inbound `MSG_TOUCH_EVENT` frames before they reach the
     /// injector. Pen samples are unaffected.
     pub disable_touch: bool,
+    /// Ask the client to hold its display awake for the session
+    /// (`CLIENT_CFG_FLAG_KEEP_AWAKE`).
+    pub keep_awake: bool,
+    /// Live pen-tip offset; see [`PenOffset`].
+    pub pen_offset: Arc<PenOffset>,
     /// Pen-button bindings to apply on the per-session injector. Default
     /// is the engine's `PenButtonProfile::default()` (Ctrl/Shift/E). The
     /// GUI converts user-edited `settings::PenBindings` to this struct
@@ -217,6 +261,8 @@ impl Default for SessionConfig {
             hud_enabled: true,
             screen_off: false,
             disable_touch: false,
+            keep_awake: false,
+            pen_offset: Arc::new(PenOffset::default()),
             pen_profile: penflow_core::inject::binding::PenButtonProfile::default(),
         }
     }
@@ -551,13 +597,14 @@ impl Session {
         // unused in v0 clients, so any older client gracefully skips it
         // (read_frame returns Ok and the dispatch loop's `_` arm drops
         // unknown ids). New clients toggle the HUD based on bit 0.
-        let client_cfg = ClientConfig {
-            flags: if self.cfg.hud_enabled {
-                CLIENT_CFG_FLAG_HUD
-            } else {
-                0
-            },
-        };
+        let mut cfg_flags = 0;
+        if self.cfg.hud_enabled {
+            cfg_flags |= CLIENT_CFG_FLAG_HUD;
+        }
+        if self.cfg.keep_awake {
+            cfg_flags |= CLIENT_CFG_FLAG_KEEP_AWAKE;
+        }
+        let client_cfg = ClientConfig { flags: cfg_flags };
         write_frame(&mut writer, MSG_CLIENT_CONFIG, &client_cfg.encode()).await?;
 
         write_frame(&mut writer, MSG_VIDEO_CONFIG, &csd0).await?;
@@ -635,6 +682,7 @@ impl Session {
             idr_tx,
             session_start,
             self.cfg.disable_touch,
+            self.cfg.pen_offset.clone(),
         ));
 
         // 8. Wait for the read loop to finish, while servicing IDR requests.
@@ -807,6 +855,9 @@ impl Session {
         if self.cfg.hud_enabled {
             cfg_flags |= CLIENT_CFG_FLAG_HUD;
         }
+        if self.cfg.keep_awake {
+            cfg_flags |= CLIENT_CFG_FLAG_KEEP_AWAKE;
+        }
         let client_cfg = ClientConfig { flags: cfg_flags };
         write_frame(&mut writer, MSG_CLIENT_CONFIG, &client_cfg.encode()).await?;
         writer.flush().await?;
@@ -840,6 +891,7 @@ impl Session {
             idr_tx,
             session_start,
             self.cfg.disable_touch,
+            self.cfg.pen_offset.clone(),
         );
         let finish_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match finish {
             Some(rx) => Box::pin(async move {
@@ -1024,23 +1076,28 @@ async fn read_loop<R: AsyncRead + Unpin>(
     idr_tx: tokio::sync::mpsc::UnboundedSender<()>,
     session_start: Instant,
     disable_touch: bool,
+    pen_offset: Arc<PenOffset>,
 ) -> Result<(), SessionError> {
     let _ = (android_w, android_h); // captured for future use
 
-    // Virtual-screen dimensions. Used to convert VMulti's normalized
+    // Virtual-screen bounding box. Used to convert VMulti's normalized
     // [0,1] tablet coords onto its logical-axis [0, 32767] range scaled
-    // across the full desktop. Captured once per session — monitor
-    // topology changes are rare and would require a session restart for
-    // the rest of the engine anyway.
+    // across the full desktop. The origin is negative whenever a monitor
+    // sits left of / above the primary, and must be subtracted from the
+    // primary-relative pixels `coords` produces. Captured once per
+    // session — monitor topology changes are rare and would require a
+    // session restart for the rest of the engine anyway.
     #[cfg(windows)]
-    let (vscreen_w, vscreen_h) = unsafe {
+    let (vscreen_x, vscreen_y, vscreen_w, vscreen_h) = unsafe {
         (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
             GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1) as u32,
             GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1) as u32,
         )
     };
     #[cfg(not(windows))]
-    let (vscreen_w, vscreen_h) = (1u32, 1u32);
+    let (vscreen_x, vscreen_y, vscreen_w, vscreen_h) = (0i32, 0i32, 1u32, 1u32);
     loop {
         let (msg_id, payload) = match read_frame(&mut reader).await {
             Ok(v) => v,
@@ -1058,12 +1115,17 @@ async fn read_loop<R: AsyncRead + Unpin>(
         match msg_id {
             MSG_PEN_EVENT => {
                 let pe = PenEvent::decode(&payload)?;
+                // Parallax offset, re-read per sample so GUI edits apply
+                // mid-session. Pen only — touch keeps the raw mapping.
+                let (dx, dy) = pen_offset.get();
+                let coords = coords.translated(dx as f32, dy as f32);
                 let (x, y) = coords.map_to_pixel(pe.x_norm, pe.y_norm);
                 // VMulti logical coords, scaled across the virtual screen.
                 // The Win32 / WinRT fallback path ignores these; the
                 // VMulti path uses them and ignores the i32 pixels above.
-                let (vx_log, vy_log) =
-                    coords.map_to_vmulti(pe.x_norm, pe.y_norm, vscreen_w, vscreen_h);
+                let (vx_log, vy_log) = coords.map_to_vmulti(
+                    pe.x_norm, pe.y_norm, vscreen_x, vscreen_y, vscreen_w, vscreen_h,
+                );
                 let sample = PenSample {
                     x,
                     y,

@@ -321,6 +321,9 @@ function resolutionLabel(resolution) {
         ?? `${resolution.width}×${resolution.height}`;
 }
 
+// Mirrors settings::MAX_PEN_OFFSET on the Rust side.
+const MAX_PEN_OFFSET = 200;
+
 function numericSpinValue(data) {
     const raw = data.value ?? data.displayValue;
     const value = typeof raw === "number" ? raw : Number(raw);
@@ -978,9 +981,45 @@ export default function App() {
                         onChange={(_, d) => setSettings({ ...settings, hud_enabled: d.checked })}
                     />
                 </div>
+                <div className={styles.row}>
+                    <span className={styles.rowLabel} title="Stop the tablet display from sleeping while it's connected to Penflow. Pen hover and PC-side activity don't count as tablet activity, so without this the tablet follows its own screen timeout and the session drops when it sleeps. Takes effect after the next reconnect.">
+                        Keep tablet awake while connected
+                    </span>
+                    <Switch
+                        checked={settings.keep_tablet_awake !== false}
+                        onChange={(_, d) => setSettings({ ...settings, keep_tablet_awake: d.checked })}
+                    />
+                </div>
                 <Caption1 style={{ color: tokens.colorNeutralForeground4 }}>
                     {elevated ? "Currently running as administrator" : "Currently running unelevated"}
                 </Caption1>
+            </section>
+
+            <section className={styles.card}>
+                <Subtitle2 className={styles.cardTitle}>Pen offset</Subtitle2>
+                <Caption1 className={styles.hint}>
+                    Nudge the cursor relative to the pen tip to cancel out display parallax, in screen pixels. Applies immediately, even mid-session.
+                </Caption1>
+                {[
+                    { label: "Horizontal (+ moves right)", key: "pen_offset_x" },
+                    { label: "Vertical (+ moves down)",    key: "pen_offset_y" },
+                ].map(({ label, key }) => (
+                    <Field key={key} label={label} orientation="horizontal" className={styles.row}>
+                        <SpinButton
+                            value={settings[key] ?? 0}
+                            min={-MAX_PEN_OFFSET}
+                            max={MAX_PEN_OFFSET}
+                            step={1}
+                            onChange={(_, d) => {
+                                const value = numericSpinValue(d);
+                                if (value !== null) {
+                                    const clamped = Math.max(-MAX_PEN_OFFSET, Math.min(MAX_PEN_OFFSET, value));
+                                    setSettings({ ...settings, [key]: clamped });
+                                }
+                            }}
+                        />
+                    </Field>
+                ))}
             </section>
 
             <section className={styles.card}>

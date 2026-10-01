@@ -16,6 +16,17 @@ class ProtocolTest {
         ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN).putLong(v).array()
 
     @Test
+    fun decodeClientConfigFlags() {
+        val cfg = Protocol.decodeClientConfig(
+            u32(Protocol.CLIENT_CFG_FLAG_KEEP_AWAKE or Protocol.CLIENT_CFG_FLAG_HUD)
+        )
+        assertEquals(true, cfg.keepAwake)
+        assertEquals(true, cfg.hudEnabled)
+        assertEquals(false, cfg.screenOff)
+        assertEquals(false, Protocol.decodeClientConfig(u32(0)).keepAwake)
+    }
+
+    @Test
     fun decodeVideoFrameLegacyHeader() {
         val pts = 12345678901234L
         val flags = 0x01.toByte()  // keyframe only

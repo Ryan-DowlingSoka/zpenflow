@@ -33,6 +33,11 @@ fn save_settings(state: tauri::State<'_, AppState>, new: Settings) -> Result<(),
     settings::validate(&new)?;
     settings::save(&new).map_err(|e| e.to_string())?;
     *state.settings.write().expect("settings poisoned") = new.clone();
+    // The pen offset is the one setting that reaches a live session; the
+    // rest wait for the next reconnect (below).
+    state
+        .service
+        .set_pen_offset(new.pen_offset_x, new.pen_offset_y);
 
     // Apply OS-level side-effects of the (run_as_admin × autostart)
     // matrix immediately. The other settings (bitrate / fps / bindings)

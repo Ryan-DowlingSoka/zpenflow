@@ -277,6 +277,11 @@ pub const CLIENT_CFG_FLAG_HUD: u32 = 1 << 0;
 /// `MSG_VIDEO_FRAME` will arrive; client should blank the panel and
 /// drop the decoder. Pen + touch still flow.
 pub const CLIENT_CFG_FLAG_SCREEN_OFF: u32 = 1 << 1;
+/// Bit 2 = keep the tablet's display awake for the life of the session.
+/// Pen hover and PC-side activity don't count as Android user activity,
+/// so without this the panel follows its normal sleep timeout — and the
+/// activity stopping on sleep tears the session down.
+pub const CLIENT_CFG_FLAG_KEEP_AWAKE: u32 = 1 << 2;
 
 /// `MSG_CLIENT_CONFIG` payload. Currently a single u32 of preference
 /// flags. Kept fixed-width so future fields can be appended after it
@@ -321,6 +326,11 @@ impl ClientConfig {
     /// Is the screen-off bit set?
     pub fn screen_off(&self) -> bool {
         self.flags & CLIENT_CFG_FLAG_SCREEN_OFF != 0
+    }
+
+    /// Is the keep-awake bit set?
+    pub fn keep_awake(&self) -> bool {
+        self.flags & CLIENT_CFG_FLAG_KEEP_AWAKE != 0
     }
 }
 
@@ -778,6 +788,17 @@ mod tests {
         bytes.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // future fields
         let back = ClientConfig::decode(&bytes).unwrap();
         assert!(back.hud_enabled());
+    }
+
+    #[test]
+    fn client_config_flags_are_independent() {
+        let c = ClientConfig {
+            flags: CLIENT_CFG_FLAG_KEEP_AWAKE | CLIENT_CFG_FLAG_SCREEN_OFF,
+        };
+        let back = ClientConfig::decode(&c.encode()).unwrap();
+        assert!(back.keep_awake());
+        assert!(back.screen_off());
+        assert!(!back.hud_enabled());
     }
 
     #[tokio::test]
