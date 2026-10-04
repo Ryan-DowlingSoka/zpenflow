@@ -347,7 +347,7 @@ fn translate_event(ev: SessionEvent) -> ServiceState {
 ///      manually deleted Penflow's adb folder. The transport crate's
 ///      `resolve_through_shim` then handles scoop-style indirection
 ///      if applicable.
-fn bundled_or_path_adb() -> String {
+pub(crate) fn bundled_or_path_adb() -> String {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let bundled = dir.join("adb").join("adb.exe");

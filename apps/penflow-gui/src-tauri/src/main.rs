@@ -6,7 +6,9 @@
 mod os;
 mod service;
 mod settings;
+mod transfer;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use tauri::{
@@ -21,6 +23,40 @@ use crate::settings::{Settings, SharedSettings};
 struct AppState {
     settings: SharedSettings,
     service: Arc<Service>,
+    /// Set while a drag-and-drop transfer to the tablet is running, so a
+    /// second drop is refused instead of racing the first on the adb link.
+    transfer_busy: Arc<AtomicBool>,
+}
+
+/// Push files dropped onto the window to the tablet's transfer folder.
+/// Returns adb's transfer summary line.
+#[tauri::command]
+async fn send_to_tablet(
+    state: tauri::State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<String, String> {
+    if state.transfer_busy.swap(true, Ordering::AcqRel) {
+        return Err("a transfer is already in progress".into());
+    }
+    // Clear the busy flag however this returns, including on a join error.
+    struct Release(Arc<AtomicBool>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let _release = Release(Arc::clone(&state.transfer_busy));
+
+    let dest = state
+        .settings
+        .read()
+        .expect("settings poisoned")
+        .tablet_transfer_dir
+        .clone();
+    let adb = service::bundled_or_path_adb();
+    tokio::task::spawn_blocking(move || transfer::send(&adb, &dest, &paths))
+        .await
+        .map_err(|e| format!("join error: {e}"))?
 }
 
 #[tauri::command]
@@ -344,6 +380,7 @@ fn main() -> std::process::ExitCode {
         .manage(AppState {
             settings: Arc::clone(&settings),
             service: Arc::clone(&service),
+            transfer_busy: Arc::new(AtomicBool::new(false)),
         })
         .setup({
             let service = Arc::clone(&service);
@@ -444,6 +481,7 @@ fn main() -> std::process::ExitCode {
             install_vdd,
             is_vmulti_installed,
             install_vmulti,
+            send_to_tablet,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Penflow GUI");

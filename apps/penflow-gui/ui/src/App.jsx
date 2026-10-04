@@ -6,6 +6,7 @@ import {
     Option,
     SpinButton,
     Field,
+    Input,
     Text,
     Title3,
     Subtitle2,
@@ -22,6 +23,7 @@ import {
 } from "@fluentui/react-components";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 
 const useStyles = makeStyles({
     root: {
@@ -41,6 +43,24 @@ const useStyles = makeStyles({
         gap: "14px",
     },
     headerSpacer: { flex: 1 },
+    // Full-window hint shown while files are dragged over the window.
+    // pointerEvents none so it never intercepts the drop itself.
+    dropOverlay: {
+        position: "fixed",
+        inset: "12px",
+        zIndex: 1000,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: "6px",
+        pointerEvents: "none",
+        borderRadius: tokens.borderRadiusXLarge,
+        ...shorthands.border("2px", "dashed", tokens.colorBrandStroke1),
+        backgroundColor: tokens.colorNeutralBackgroundAlpha2,
+        backdropFilter: "blur(6px)",
+        textAlign: "center",
+    },
     title: { margin: 0 },
     statusDetail: {
         color: tokens.colorNeutralForeground3,
@@ -324,6 +344,26 @@ function resolutionLabel(resolution) {
 // Mirrors settings::MAX_PEN_OFFSET on the Rust side.
 const MAX_PEN_OFFSET = 200;
 
+// Mirrors transfer::DEFAULT_DEST / transfer::validate_dest on the Rust side.
+// Returns an error message, or "" when the folder is acceptable.
+const DEFAULT_TABLET_DIR = "/sdcard/Download/Penflow";
+function tabletDirError(dir) {
+    if (!dir.startsWith("/sdcard/") && !dir.startsWith("/storage/")) {
+        return "Must start with /sdcard/ or /storage/";
+    }
+    if (!/^[A-Za-z0-9 _\-./()]*$/.test(dir)) {
+        return "Only letters, digits, spaces and _ - . / ( ) are allowed";
+    }
+    if (dir.split("/").includes("..")) {
+        return "May not contain ..";
+    }
+    return "";
+}
+
+function fileCountLabel(n) {
+    return n === 1 ? "1 item" : `${n} items`;
+}
+
 function numericSpinValue(data) {
     const raw = data.value ?? data.displayValue;
     const value = typeof raw === "number" ? raw : Number(raw);
@@ -542,6 +582,11 @@ export default function App() {
     const [vmultiInstalled, setVmultiInstalled] = useState(true);
     const [vmultiInstalling, setVmultiInstalling] = useState(false);
     const [vmultiInstallError, setVmultiInstallError] = useState("");
+    // Drag-and-drop transfer to the tablet. `dragCount` > 0 while files are
+    // held over the window; `transfer` describes the latest send:
+    // { state: "sending" | "done" | "error", count, message }.
+    const [dragCount, setDragCount] = useState(0);
+    const [transfer, setTransfer] = useState(null);
     // Skip the first auto-save pass so loading settings from disk doesn't
     // immediately round-trip them back.
     const skipNextAutoSaveRef = useRef(true);
@@ -569,6 +614,40 @@ export default function App() {
         const unlistenP = listen("service-state", (ev) => setStatus(ev.payload));
         return () => { unlistenP.then((fn) => fn()).catch(() => {}); };
     }, []);
+
+    // Files dropped anywhere on the window are pushed to the tablet over
+    // adb. Tauri delivers OS drag-and-drop as webview events with real file
+    // paths (the browser's own drop events never see them).
+    useEffect(() => {
+        const unlistenP = getCurrentWebview().onDragDropEvent(async (ev) => {
+            const p = ev.payload;
+            if (p.type === "enter") {
+                setDragCount(p.paths?.length || 1);
+            } else if (p.type === "leave") {
+                setDragCount(0);
+            } else if (p.type === "drop") {
+                setDragCount(0);
+                const paths = p.paths ?? [];
+                if (paths.length === 0) return;
+                setTransfer({ state: "sending", count: paths.length, message: "" });
+                try {
+                    const summary = await invoke("send_to_tablet", { paths });
+                    setTransfer({ state: "done", count: paths.length, message: summary });
+                } catch (e) {
+                    setTransfer({ state: "error", count: paths.length, message: String(e) });
+                }
+            }
+        });
+        return () => { unlistenP.then((fn) => fn()).catch(() => {}); };
+    }, []);
+
+    // Let a finished transfer's banner fade after a while; errors stay
+    // until dismissed so they aren't missed.
+    useEffect(() => {
+        if (transfer?.state !== "done") return;
+        const t = setTimeout(() => setTransfer(null), 8000);
+        return () => clearTimeout(t);
+    }, [transfer]);
 
     const onInstallVdd = useCallback(async () => {
         setVddInstalling(true);
@@ -738,9 +817,19 @@ export default function App() {
     const isDuplicate = topology === "duplicate";
     const screenOff = settings.screen_off === true;
     const showEncoder = !(isDuplicate && screenOff);
+    const tabletDir = settings.tablet_transfer_dir ?? DEFAULT_TABLET_DIR;
+    const tabletDirProblem = tabletDirError(tabletDir);
 
     return (
         <div className={styles.root}>
+            {dragCount > 0 && (
+                <div className={styles.dropOverlay}>
+                    <Title3>Drop to send to tablet</Title3>
+                    <Caption1>
+                        {fileCountLabel(dragCount)} → {tabletDir}
+                    </Caption1>
+                </div>
+            )}
             <header className={styles.header}>
                 <Title3 className={styles.title}>Penflow</Title3>
                 <span className={styles.statusDetail}>{statusDescription(status)}</span>
@@ -768,6 +857,30 @@ export default function App() {
                     {statusActionLabel}
                 </Button>
             </header>
+
+            {transfer && (
+                <MessageBar
+                    intent={
+                        transfer.state === "error" ? "error"
+                            : transfer.state === "done" ? "success"
+                            : "info"
+                    }
+                >
+                    <MessageBarBody>
+                        <MessageBarTitle>
+                            {transfer.state === "sending" && `Sending ${fileCountLabel(transfer.count)} to the tablet…`}
+                            {transfer.state === "done" && `Sent ${fileCountLabel(transfer.count)} to ${tabletDir}`}
+                            {transfer.state === "error" && "Couldn't send to the tablet"}
+                        </MessageBarTitle>
+                        {transfer.message}
+                    </MessageBarBody>
+                    <MessageBarActions>
+                        {transfer.state === "sending"
+                            ? <Spinner size="tiny" />
+                            : <Button appearance="transparent" onClick={() => setTransfer(null)}>Dismiss</Button>}
+                    </MessageBarActions>
+                </MessageBar>
+            )}
 
             {!vddInstalled && (
                 <MessageBar intent={vddInstallError ? "error" : "warning"}>
@@ -1020,6 +1133,24 @@ export default function App() {
                         />
                     </Field>
                 ))}
+            </section>
+
+            <section className={styles.card}>
+                <Subtitle2 className={styles.cardTitle}>Send files to tablet</Subtitle2>
+                <Caption1 className={styles.hint}>
+                    Drag files or folders onto this window to copy them to the tablet over USB. They appear in the tablet's Files app; the default folder shows up under Downloads.
+                </Caption1>
+                <Field
+                    label="Tablet folder"
+                    orientation="horizontal"
+                    validationState={tabletDirProblem ? "error" : "none"}
+                    validationMessage={tabletDirProblem || undefined}
+                >
+                    <Input
+                        value={tabletDir}
+                        onChange={(_, d) => setSettings({ ...settings, tablet_transfer_dir: d.value })}
+                    />
+                </Field>
             </section>
 
             <section className={styles.card}>

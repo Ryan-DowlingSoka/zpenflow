@@ -72,10 +72,18 @@ pub struct Settings {
     pub pen_offset_x: i32,
     #[serde(default)]
     pub pen_offset_y: i32,
+    /// Folder on the tablet that files dropped onto the Penflow window are
+    /// pushed into (see `transfer`).
+    #[serde(default = "default_tablet_transfer_dir")]
+    pub tablet_transfer_dir: String,
 }
 
 fn default_hud_enabled() -> bool {
     true
+}
+
+fn default_tablet_transfer_dir() -> String {
+    crate::transfer::DEFAULT_DEST.to_string()
 }
 
 fn default_keep_tablet_awake() -> bool {
@@ -103,6 +111,7 @@ impl Default for Settings {
             keep_tablet_awake: default_keep_tablet_awake(),
             pen_offset_x: 0,
             pen_offset_y: 0,
+            tablet_transfer_dir: default_tablet_transfer_dir(),
         }
     }
 }
@@ -453,5 +462,6 @@ mod tests {
         let s: Settings = serde_json::from_str("{}").expect("empty settings should parse");
         assert!(s.keep_tablet_awake);
         assert_eq!((s.pen_offset_x, s.pen_offset_y), (0, 0));
+        assert_eq!(s.tablet_transfer_dir, crate::transfer::DEFAULT_DEST);
     }
 }
