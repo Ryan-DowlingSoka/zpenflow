@@ -6,6 +6,7 @@
 mod os;
 mod service;
 mod settings;
+mod single_instance;
 mod transfer;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -340,6 +341,14 @@ fn main() -> std::process::ExitCode {
         }
     }
 
+    // One GUI at a time: a second one would race this one's service for the
+    // tablet's reverse tunnel. Done after the elevated handoff above, which
+    // exits this process when it hands over.
+    let Some(_instance) = single_instance::acquire() else {
+        eprintln!("[gui] Penflow is already running; showed its window instead");
+        return std::process::ExitCode::SUCCESS;
+    };
+
     // Register the virtual touchscreen now, and keep it for as long as the
     // GUI runs, rather than only while a tablet session is up. Apps check
     // for touch hardware when they launch, so one started while no tablet
@@ -385,6 +394,10 @@ fn main() -> std::process::ExitCode {
         .setup({
             let service = Arc::clone(&service);
             move |app| {
+                // A later launch asks this instance to come forward.
+                let handle = app.handle().clone();
+                single_instance::listen_for_show(move || show_main_window(&handle));
+
                 // Apply Win11 Mica to the main window. Falls back silently
                 // on Win10 or older where Mica isn't supported (apply_mica
                 // returns Err but it's not fatal).

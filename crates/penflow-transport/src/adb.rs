@@ -232,6 +232,49 @@ impl AdbLocalAbstractTransport {
     pub fn abstract_name(&self) -> &str {
         &self.abstract_name
     }
+
+    /// Re-add the reverse rule if it's gone. ADB drops reverse rules when
+    /// the device reconnects (a loose cable, the tablet sleeping its USB),
+    /// and another adb client can remove ours; either way the listener
+    /// would wait forever for a connection that can't arrive. Failures
+    /// (no device right now) are left for the next check.
+    async fn ensure_reverse(&self) {
+        let adb = self.adb_path.clone();
+        let name = self.abstract_name.clone();
+        let port = self.bound_port;
+        let result = tokio::task::spawn_blocking(move || -> io::Result<bool> {
+            let rule = format!("localabstract:{name} tcp:{port}");
+            let list = run_adb(&adb, &["reverse", "--list"])?;
+            if reverse_list_has(&String::from_utf8_lossy(&list.stdout), &rule) {
+                return Ok(false);
+            }
+            run_adb(
+                &adb,
+                &[
+                    "reverse",
+                    &format!("localabstract:{name}"),
+                    &format!("tcp:{port}"),
+                ],
+            )?;
+            Ok(true)
+        })
+        .await;
+        match result {
+            Ok(Ok(true)) => eprintln!("[adb] reverse rule was missing; re-added"),
+            Ok(Ok(false)) => {}
+            Ok(Err(_)) | Err(_) => {} // no device right now; try again next time
+        }
+    }
+}
+
+/// How often a waiting listener checks that its reverse rule still exists.
+const REVERSE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Whether `adb reverse --list` output contains `rule`
+/// ("localabstract:<name> tcp:<port>"). Lines look like
+/// "UsbFfs localabstract:penflow tcp:59307".
+fn reverse_list_has(list: &str, rule: &str) -> bool {
+    list.lines().any(|line| line.trim().ends_with(rule))
 }
 
 #[async_trait]
@@ -241,7 +284,15 @@ impl Transport for AdbLocalAbstractTransport {
         let listener = g.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "transport already shut down")
         })?;
-        let (sock, peer) = listener.accept().await?;
+        // Keep the reverse rule alive while waiting; see `ensure_reverse`.
+        let mut check = tokio::time::interval(REVERSE_CHECK_INTERVAL);
+        check.tick().await; // the first tick is immediate; the rule was just set
+        let (sock, peer) = loop {
+            tokio::select! {
+                r = listener.accept() => break r?,
+                _ = check.tick() => self.ensure_reverse().await,
+            }
+        };
         // Disable Nagle so small input messages (PEN_EVENT, TIME_SYNC_REQ)
         // ship immediately. ADB's USB tunnel is already low-latency; we
         // don't want the kernel to coalesce.
@@ -416,6 +467,24 @@ fn run_adb(adb_path: &str, args: &[&str]) -> io::Result<Output> {
         )));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod reverse_list_tests {
+    use super::reverse_list_has;
+
+    #[test]
+    fn finds_our_rule_among_others() {
+        let list = "UsbFfs tcp:8765 tcp:8765\nUsbFfs localabstract:penflow tcp:59307\n";
+        assert!(reverse_list_has(list, "localabstract:penflow tcp:59307"));
+    }
+
+    #[test]
+    fn a_rule_for_another_port_or_name_does_not_count() {
+        let list = "UsbFfs localabstract:penflow tcp:50000\nUsbFfs localabstract:other tcp:59307\n";
+        assert!(!reverse_list_has(list, "localabstract:penflow tcp:59307"));
+        assert!(!reverse_list_has("", "localabstract:penflow tcp:59307"));
+    }
 }
 
 #[cfg(test)]
